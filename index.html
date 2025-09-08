@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hex Prefetch Demo</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #0f1115; color: #eaeef7; font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
+    #ui { position: fixed; top: 8px; left: 8px; right: 8px; display: flex; gap: 12px; align-items: center; z-index: 10; pointer-events: none; flex-wrap: nowrap; white-space: nowrap; }
+    #ui .pill { pointer-events: auto; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; padding: 6px 10px; flex: 0 0 auto; }
+    #ui code { color: #b6c2ff; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; } 
+    /* fixed widths for dynamic fields to prevent reflow */
+    #mouse, #hex, #wedge, #mode { display: inline-block; }
+    #mouse { width: 12ch; }
+    #hex   { width: 18ch; }
+    #wedge { width: 2ch; text-align: right; }
+    #mode  { width: 12ch; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    a { color: #8fd3ff; text-decoration: none; }
+      #bottom { position: fixed; left: 8px; right: 8px; bottom: 8px; z-index: 10; pointer-events: none; display: flex; flex-direction: column; gap: 8px; }
+    #bottom .row { display: flex; gap: 12px; align-items: center; flex-wrap: nowrap; white-space: nowrap; }
+    #bottom .pill { pointer-events: auto; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div class="pill">Mouse <code id="mouse"></code></div>
+    <div class="pill">Hex <code id="hex"></code></div>
+    <div class="pill">Wedge <code id="wedge"></code></div>
+    <div class="pill">Mode <code id="mode"></code></div>
+  </div>
+  <div id="bottom">
+    <div class="row">
+      <div class="pill">Hover the canvas. LOD0: blue center and yellow prefetch. LOD2: lavender ring. LOD3: faint grid.</div>
+    </div>
+    <div class="row">
+      <div class="pill"><label><input id="extended" type="checkbox"> extended prefetch</label></div>
+      <div class="pill"><label><input id="debug" type="checkbox"> debug</label></div>
+      <div class="pill">Map <input id="mapfile" type="file" accept="image/*"> <label>opacity <input id="bgop" type="range" min="0" max="1" step="0.05" value="1"></label></div>
+    </div>
+  </div>
+  <canvas id="c"></canvas>
+  <script>
+  (() => {
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+
+    // Grid appearance
+    const GRID_COLOR = 'rgba(0,0,0,0.35)';
+    const GRID_LINE = 1.25;
+
+    let W = 0, H = 0;
+    function resize() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      W = canvas.clientWidth = window.innerWidth;
+      H = canvas.clientHeight = window.innerHeight;
+      canvas.width = Math.floor(W * dpr);
+      canvas.height = Math.floor(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Grid params
+    const SQRT3 = Math.sqrt(3);
+    const size = 36; // hex radius
+    const DEADZONE = size * 0.5; // deadzone radius
+
+    // Camera origin at screen center for friendlier numbers
+    function toWorld(px, py) { return { x: px - W * 0.5, y: py - H * 0.5 }; }
+    function toScreen(wx, wy) { return { x: wx + W * 0.5, y: wy + H * 0.5 }; }
+
+    // Axial <-> pixel for pointy top
+    function axialToPixel(q, r) {
+      const x = size * SQRT3 * (q + r / 2);
+      const y = size * 1.5 * r;
+      return { x, y };
+    }
+    function pixelToAxial(x, y) {
+      const q = (SQRT3 / 3 * x - 1 / 3 * y) / size;
+      const r = (2 / 3 * y) / size;
+      return { q, r };
+    }
+
+    // Cube helpers
+    function axialToCube(q, r) { return { x: q, z: r, y: -q - r }; }
+    function cubeToAxial(x, y, z) { return { q: x, r: z }; }
+    function cubeRound(x, y, z) {
+      let rx = Math.round(x), ry = Math.round(y), rz = Math.round(z);
+      const dx = Math.abs(rx - x), dy = Math.abs(ry - y), dz = Math.abs(rz - z);
+      if (dx > dy && dx > dz) rx = -ry - rz;
+      else if (dy > dz) ry = -rx - rz;
+      else rz = -rx - ry;
+      return { x: rx, y: ry, z: rz };
+    }
+
+    const DIRS = [
+      {q:+1, r:0}, {q:+1, r:-1}, {q:0, r:-1}, {q:-1, r:0}, {q:-1, r:+1}, {q:0, r:+1}
+    ];
+
+    // Hex polygon points for pointy top with base angle 0 rad at east
+    function hexVertices() {
+      const out = [];
+      // Use pointy-top corner angles starting at 30deg to match axial layout spacing
+      for (let i = 0; i < 6; i++) {
+        const a = Math.PI / 6 + i * Math.PI / 3; // 30°, 90°, ...
+        out.push({ x: size * Math.cos(a), y: size * Math.sin(a) });
+      }
+      return out;
+    }
+    const VERTS = hexVertices();
+    const EDGES = VERTS.map((v, i) => ({ x: 0.5 * (v.x + VERTS[(i + 1) % 6].x), y: 0.5 * (v.y + VERTS[(i + 1) % 6].y) }));
+
+    // Drawing helpers
+    function pathHex(cx, cy) {
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const vx = cx + VERTS[i].x;
+        const vy = cy + VERTS[i].y;
+        if (i === 0) ctx.moveTo(vx, vy); else ctx.lineTo(vx, vy);
+      }
+      ctx.closePath();
+    }
+    function strokeFillHex(cx, cy, stroke, fill, lineWidth = 2) {
+      pathHex(cx, cy);
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      ctx.lineWidth = lineWidth;
+      ctx.strokeStyle = stroke;
+      ctx.stroke();
+    }
+
+    function drawWedge(cx, cy, wedgeIdx, fill = 'rgba(180,120,255,0.12)', stroke = 'rgba(180,120,255,0.85)') {
+      // Wedge k is the triangular sector bounded by vertices k and k+1 when vertices start at 30deg
+      const v0 = VERTS[wedgeIdx];
+      const v1 = VERTS[(wedgeIdx + 1) % 6];
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + v0.x, cy + v0.y);
+      ctx.lineTo(cx + v1.x, cy + v1.y);
+      ctx.closePath();
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // Mouse state
+    let mouse = { x: 0, y: 0 };
+    canvas.addEventListener('mousemove', e => {
+      const rect = canvas.getBoundingClientRect();
+      mouse.x = e.clientX - rect.left;
+      mouse.y = e.clientY - rect.top;
+    });
+
+    // UI
+    const $mouse = document.getElementById('mouse');
+    const $hex = document.getElementById('hex');
+    const $wedge = document.getElementById('wedge');
+    const $mode = document.getElementById('mode');
+    const $extended = document.getElementById('extended');
+    const $debug = document.getElementById('debug');
+    const $mapfile = document.getElementById('mapfile');
+    const $bgop = document.getElementById('bgop');
+
+    // Background image support: file input and drag drop
+    const bg = { img: null, ready: false, opacity: 1 };
+    function loadMapFile(file) {
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => { bg.img = img; bg.ready = true; };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    }
+    $mapfile && $mapfile.addEventListener('change', e => loadMapFile(e.target.files[0]));
+    $bgop && $bgop.addEventListener('input', e => { bg.opacity = parseFloat(e.target.value || '1'); });
+    canvas.addEventListener('dragover', e => { e.preventDefault(); });
+    canvas.addEventListener('drop', e => {
+      e.preventDefault();
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f && f.type && f.type.startsWith('image/')) loadMapFile(f);
+    });
+
+    function nearestBoundary(localX, localY) {
+      // Choose closest between vertices and edge midpoints, with a small bias toward vertices
+      let bestEdge = { index: 0, d2: Infinity };
+      for (let i = 0; i < 6; i++) {
+        const ex = EDGES[i].x, ey = EDGES[i].y;
+        const dx = localX - ex, dy = localY - ey;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestEdge.d2) bestEdge = { index: i, d2 };
+      }
+      let bestVertex = { index: 0, d2: Infinity };
+      for (let i = 0; i < 6; i++) {
+        const vx = VERTS[i].x, vy = VERTS[i].y;
+        const dx = localX - vx, dy = localY - vy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestVertex.d2) bestVertex = { index: i, d2 };
+      }
+      const dEdge = Math.sqrt(bestEdge.d2);
+      const dVert = Math.sqrt(bestVertex.d2);
+      const bias = Math.max(1, size * 0.05); // prefer vertex when within a pixel or so
+      if (dVert <= dEdge + bias) return { kind: 'vertex', index: bestVertex.index, dist: dVert };
+      return { kind: 'edge', index: bestEdge.index, dist: dEdge };
+    }
+
+    function angleWedge(localX, localY) {
+      // Wedge index 0..5. Vertices start at 30deg, so shift the angle by -30deg
+      let ang = Math.atan2(localY, localX); // -pi..pi
+      const twopi = Math.PI * 2;
+      ang = (ang + twopi) % twopi; // 0..2pi
+      const sector = twopi / 6;
+      const base = Math.PI / 6; // 30deg
+      const shifted = (ang - base + twopi) % twopi;
+      const wedge = Math.floor(shifted / sector) % 6;
+      return wedge;
+    }
+
+    function prefetchSet(q, r, boundary, center, extended) {
+      // Robust neighbor selection by comparing against real neighbor directions
+      const set = new Set();
+      const add = (aq, ar) => set.add(`${aq},${ar}`);
+
+      // All six neighbors
+      const neighbors = DIRS.map(d => ({ q: q + d.q, r: r + d.r }));
+
+      // Build local vectors from current hex center to each neighbor center
+      const neighborVecs = neighbors.map(n => {
+        const p = axialToPixel(n.q, n.r);
+        return { x: p.x - center.x, y: p.y - center.y };
+      });
+
+      // Given an edge index, find the neighbor that is most aligned with that edge midpoint vector
+      function dirFromEdge(eIdx) {
+        const e = EDGES[eIdx];
+        let best = 0, bestDot = -Infinity;
+        for (let i = 0; i < 6; i++) {
+          const v = neighborVecs[i];
+          const dot = v.x * e.x + v.y * e.y;
+          if (dot > bestDot) { bestDot = dot; best = i; }
+        }
+        return best; // neighbor direction index 0..5
+      }
+
+      if (boundary.kind === 'edge') {
+        const k = dirFromEdge(boundary.index);
+        // Across the edge
+        add(neighbors[k].q, neighbors[k].r);
+        if (extended) {
+          // The two directions adjacent to k share the edge's vertices
+          const kL = (k + 5) % 6;
+          const kR = (k + 1) % 6;
+          add(neighbors[kL].q, neighbors[kL].r);
+          add(neighbors[kR].q, neighbors[kR].r);
+        }
+      } else { // vertex
+        // A vertex is bounded by two edges: (vIdx-1) and vIdx
+        const eL = (boundary.index + 5) % 6;
+        const eR = boundary.index;
+        const kL = dirFromEdge(eL);
+        const kR = dirFromEdge(eR);
+        add(neighbors[kL].q, neighbors[kL].r);
+        add(neighbors[kR].q, neighbors[kR].r);
+      }
+
+      return [...set].map(s => s.split(',').map(Number));
+    }
+
+    function drawGridAround(q, r, radius) {
+      for (let dq = -radius; dq <= radius; dq++) {
+        for (let dr = Math.max(-radius, -dq - radius); dr <= Math.min(radius, -dq + radius); dr++) {
+          const qq = q + dq;
+          const rr = r + dr;
+          const { x, y } = axialToPixel(qq, rr);
+          strokeFillHex(x + W * 0.5, y + H * 0.5, GRID_COLOR, null, GRID_LINE);
+        }
+      }
+    }
+
+    function drawDot(x, y, r, fill) {
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fillStyle = fill;
+      ctx.fill();
+    }
+
+    function drawBackground() {
+      if (!bg.ready || !bg.img) return;
+      const iw = bg.img.width, ih = bg.img.height;
+      const scale = Math.max(W / iw, H / ih);
+      const dw = iw * scale, dh = ih * scale;
+      const dx = (W - dw) * 0.5, dy = (H - dh) * 0.5;
+      ctx.save();
+      ctx.globalAlpha = bg.opacity;
+      ctx.drawImage(bg.img, dx, dy, dw, dh);
+      ctx.restore();
+    }
+
+    let lastHover = { q: Infinity, r: Infinity };
+
+    let lastPrefetch = []; // persist LOD0 prefetch set even in deadzone
+
+    function frame() {
+      ctx.clearRect(0, 0, W, H);
+
+      // draw map background if present
+      drawBackground();
+
+      // Mouse in world space
+      const w = toWorld(mouse.x, mouse.y);
+
+      // Pick hex
+      const frac = pixelToAxial(w.x, w.y);
+      const c = axialToCube(frac.q, frac.r);
+      const rc = cubeRound(c.x, c.y, c.z);
+      const a = cubeToAxial(rc.x, rc.y, rc.z);
+
+      // Local vector inside the hovered hex
+      const center = axialToPixel(a.q, a.r);
+      const localX = w.x - center.x;
+      const localY = w.y - center.y;
+
+      // Wedge and boundary
+      const wedgeIdx = angleWedge(localX, localY);
+      const bound = nearestBoundary(localX, localY);
+
+      // Prefetch set with persistence across deadzone
+      let pre;
+      const distCenter = Math.hypot(localX, localY);
+      const inDeadzone = distCenter < DEADZONE;
+      if (!inDeadzone) {
+        pre = prefetchSet(a.q, a.r, bound, center, $extended.checked);
+        lastPrefetch = pre;
+      } else {
+        pre = lastPrefetch;
+      }
+
+      // Background grid around hover
+      drawGridAround(a.q, a.r, 6);
+
+      // Always draw ring 1 in lavender
+      for (const d of DIRS) {
+        const rq = a.q + d.q;
+        const rr = a.r + d.r;
+        const p = axialToPixel(rq, rr);
+        const scr = toScreen(p.x, p.y);
+        strokeFillHex(scr.x, scr.y, 'rgba(200,160,255,0.9)', 'rgba(200,160,255,0.12)', 2);
+      }
+
+      // Draw hovered hex in blue
+      {
+        const scr = toScreen(center.x, center.y);
+        strokeFillHex(scr.x, scr.y, 'rgba(120,180,255,0.9)', 'rgba(120,180,255,0.12)', 3);
+        // Highlight current wedge
+        if (!inDeadzone) {
+          drawWedge(scr.x, scr.y, wedgeIdx);
+          // Highlight closest boundary point
+          const bx = scr.x + (bound.kind === 'edge' ? EDGES[bound.index].x : VERTS[bound.index].x);
+          const by = scr.y + (bound.kind === 'edge' ? EDGES[bound.index].y : VERTS[bound.index].y);
+          ctx.beginPath();
+          ctx.arc(bx, by, 5, 0, Math.PI * 2);
+          ctx.fillStyle = '#ff66cc';
+          ctx.fill();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = 'rgba(255,102,204,0.8)';
+          ctx.stroke();
+        }
+
+        // Deadzone circle
+        ctx.beginPath();
+        ctx.arc(scr.x, scr.y, DEADZONE, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      // Draw prefetch hexes in yellow
+      for (const [pq, pr] of pre) {
+        const p = axialToPixel(pq, pr);
+        const scr = toScreen(p.x, p.y);
+        strokeFillHex(scr.x, scr.y, 'rgba(255,220,120,0.9)', 'rgba(255,220,120,0.12)', 2);
+      }
+
+      // Debug overlay
+      if ($debug.checked) {
+        const scr = toScreen(center.x, center.y);
+        // center
+        drawDot(scr.x, scr.y, 3, '#ffffff');
+        // deadzone ring
+        ctx.beginPath();
+        ctx.arc(scr.x, scr.y, DEADZONE, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // vertices and edges
+        for (let i = 0; i < 6; i++) {
+          const vx = scr.x + VERTS[i].x;
+          const vy = scr.y + VERTS[i].y;
+          drawDot(vx, vy, 3, '#7fb3ff');
+          const ex = scr.x + EDGES[i].x;
+          const ey = scr.y + EDGES[i].y;
+          drawDot(ex, ey, 3, '#ffd87a');
+        }
+        // line to nearest boundary
+        const bx = scr.x + (bound.kind === 'edge' ? EDGES[bound.index].x : VERTS[bound.index].x);
+        const by = scr.y + (bound.kind === 'edge' ? EDGES[bound.index].y : VERTS[bound.index].y);
+        ctx.beginPath();
+        ctx.moveTo(scr.x, scr.y);
+        ctx.lineTo(bx, by);
+        ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // UI text
+      document.getElementById('mouse').textContent = `${Math.round(mouse.x)},${Math.round(mouse.y)}`;
+      document.getElementById('hex').textContent = `q=${a.q} r=${a.r}`;
+      document.getElementById('wedge').textContent = `${wedgeIdx}`;
+      document.getElementById('mode').textContent = inDeadzone ? 'deadzone' : `${bound.kind} ${bound.index}`;
+
+      lastHover = a;
+      requestAnimationFrame(frame);
+    }
+
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
